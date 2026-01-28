@@ -1,0 +1,461 @@
+"""
+# NAC checker for Lemma 3.5 v2 (b from 7 to 21)
+"""
+
+from fractions import Fraction
+import itertools
+import math
+import numpy as np
+from mpmath import mp, mpi
+
+# -----------------------------
+# Global tweakable parameters
+# -----------------------------
+B_INCREMENT = 0.01       # default fine increment for first refinement (fast stage)
+ABC_WIDTH = 1.0          # sampling range for A and C: [-ABC_WIDTH, ABC_WIDTH]
+A_RES_DEFAULT = 200
+C_RES_DEFAULT = 200
+
+# -----------------------------
+# Utility: build 2x2 f-matrix from A = ((a,b),(c,d))
+# -----------------------------
+def f_matrix_from_A(A):
+    """
+    Given A as ((a,b),(c,d)) produce the corresponding f-matrix:
+      [[a - b - c + d, a - b + c - d],
+       [a + b - c - d, a + b + c + d]]
+    (keeps integer arithmetic when inputs are integers).
+    """
+    (a, b_), (c, d) = A
+    return ((a - b_ - c + d, a - b_ + c - d),
+            (a + b_ - c - d, a + b_ + c + d))
+
+
+def compute_Ai_matrix(D1, D2, i_shift, base_b):
+    """
+    Compute A_i matrix (2x2) for given sets D1, D2, shift index i and modulus b.
+    Each entry is the size of an intersection of shifted sets (integers).
+    Returns tuple-of-tuples representing 2x2 integer matrix.
+    """
+    rows = []
+    for row_idx in (0, 1):
+        row = []
+        for col_idx in (0, 1):
+            set1 = {x + row_idx + i_shift for x in D1}
+            set2 = {x + col_idx * base_b for x in D2}
+            row.append(len(set1 & set2))
+        rows.append(tuple(row))
+    return tuple(rows)
+
+
+# -----------------------------
+# Fast vectorized computation (stage 1)
+# -----------------------------
+def compute_components_and_us(A_vals, C_vals, B_scalar, f_vec):
+    """
+    Vectorized computation of the intermediate quantities and u-values.
+    A_vals and C_vals are numpy arrays (possibly meshgrid arrays).
+    f_vec is a 4-length numeric vector [u, v, w, x] (float).
+    Returns elementwise arrays for p1,p2,q1,q2,u1,u2,u3,m,ratio2,ratio1.
+    """
+    # f_vec expected in order: u, v, w, x
+    u, v, w, x = f_vec.astype(float)
+    D = 1.0
+    # denom may be an array if A_vals is array
+    denom = (A_vals * D) - (B_scalar * C_vals)
+
+    # numerator expressions (broadcast over A_vals/C_vals)
+    S00 = A_vals * u - (A_vals * C_vals) * v + B_scalar * w - (B_scalar * C_vals) * x
+    S01 = (A_vals * A_vals) * v + (A_vals * B_scalar) * x - (A_vals * B_scalar) * u - (B_scalar * B_scalar) * w
+    S10 = C_vals * u - (C_vals * C_vals) * v + w - C_vals * x
+    S11 = (C_vals * A_vals) * v + A_vals * x - (C_vals * B_scalar) * u - B_scalar * w
+
+    # divide while suppressing numpy warnings; invalid entries become nan/inf
+    with np.errstate(divide='ignore', invalid='ignore'):
+        p1 = S00 / denom
+        p2 = S01 / denom
+        q1 = S10 / denom
+        q2 = S11 / denom
+
+        # r is scalar (w/x) unless x==0 -> nan
+        r = np.nan if x == 0 else (w / x)
+
+        # u1,u2,u3,m and ratios (elementwise)
+        # protect against elementwise invalid operations (numpy yields nan/inf)
+        u1 = np.abs(p2 / q2)
+        u2 = np.abs((p2 / q2) - (p1 / q1))
+        u3 = np.abs(q1 / q2)
+        m = np.maximum(u1, u2)
+
+        ratio1 = np.abs(C_vals / A_vals)   # elementwise
+        denom_ratio2 = (A_vals - r * B_scalar)
+        ratio2 = np.abs((C_vals - r * D) / denom_ratio2) if not np.isnan(r) else np.full_like(A_vals, np.nan)
+
+    return p1, p2, q1, q2, u1, u2, u3, m, ratio2, ratio1
+
+
+def evaluate_grid_conditions(A_vals, C_vals, B_scalar, f_vec):
+    """
+    Evaluate the boolean mask of points (A_vals, C_vals) that satisfy all
+    fast-stage inequalities for a particular f_vec and B_scalar.
+    Returns a boolean array (same shape as A_vals/C_vals).
+    """
+    _, _, _, _, u1, u2, u3, m, ratio2, ratio1 = compute_components_and_us(A_vals, C_vals, B_scalar, f_vec)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        denom_1_minus_m = (1.0 - m)
+        term1 = m
+        term2 = (m * u3) / (denom_1_minus_m ** 2)   # may produce inf when denom_1_minus_m == 0
+        term3 = np.abs(u3 / denom_1_minus_m)
+
+        cond_u1 = (u1 < 0.5)
+        combined_max = np.maximum(np.maximum(term1, term2), term3)
+        cond_combined = (combined_max < 1.0)
+
+        cond_ratio_CA = (ratio1 < 1.0)
+        cond_ratio2 = (ratio2 < 1.0)
+        cond_extra1 = (np.abs(A_vals + B_scalar) < np.abs(C_vals + 1.0))
+        cond_extra2 = (np.abs(-A_vals + B_scalar) < np.abs(1.0 - C_vals))
+    finite_mask = (
+        np.isfinite(u1) & np.isfinite(u2) & np.isfinite(u3) &
+        np.isfinite(m) & np.isfinite(ratio1) & np.isfinite(ratio2)
+    )
+
+    result_mask = cond_u1 & cond_combined & cond_ratio_CA & cond_ratio2 & cond_extra1 & cond_extra2 & finite_mask
+    return result_mask.astype(bool)
+
+
+# -----------------------------
+# Rigorous verification using mpmath.mpi (outward interval arithmetic)
+# -----------------------------
+def _abs_interval(interval):
+    """Absolute value for an mpi interval (conservative)."""
+    a, b = interval.a, interval.b
+    if a >= 0:
+        return mpi(a, b)
+    if b <= 0:
+        return mpi(-b, -a)
+    return mpi(0, max(abs(a), abs(b)))
+
+
+def _max_intervals(*intervals):
+    """Return interval [max(lower bounds), max(upper bounds)]."""
+    lowers = [I.a for I in intervals]
+    uppers = [I.b for I in intervals]
+    return mpi(max(lowers), max(uppers))
+
+
+def _interval_is_finite(I):
+    return (not mp.isinf(I.a)) and (not mp.isinf(I.b)) and (not mp.isnan(I.a)) and (not mp.isnan(I.b))
+
+
+def rigorous_check_candidate(A_val, B_val, C_val, f_vectors,
+                             initial_dps=80, max_dps=320, mult=2):
+    """
+    Rigorous verification for a candidate (A_val, B_val, C_val).
+    Returns (True, info) on success where info contains intervals aggregated
+    across all shifts i; otherwise (False, info) with a 'log' describing why.
+    """
+    dps = initial_dps
+    last_log = []
+
+    while dps <= max_dps:
+        mp.dps = dps
+
+        # convert inputs to conservative mpi intervals
+        A = mpi(mp.mpf(A_val))
+        B = mpi(mp.mpf(B_val))
+        C = mpi(mp.mpf(C_val))
+        D = mpi(mp.mpf('1'))
+
+        per_i_combined = []
+        per_i_u1 = []
+        per_i_ratio1 = []
+        per_i_ratio2 = []
+        local_log = []
+        all_ok = True
+        extra1 = _abs_interval(A + B)
+        rhs1   = _abs_interval(C + D)
+        extra2 = _abs_interval(-A + B)
+        rhs2   = _abs_interval(-C + D)
+        # cond_e1 and cond_e2 ensures that the image of phi is contained in the interval (-1, 1)
+        cond_e1 = (extra1.b < rhs1.a)
+        cond_e2 = (extra2.b < rhs2.a)
+        for i_idx, f_vec in enumerate(f_vectors):
+            # f_vec is numeric (u,v,w,x) but we treat them as exact integers here
+            u = mpi(mp.mpf(str(int(f_vec[0]))))
+            v = mpi(mp.mpf(str(int(f_vec[1]))))
+            w = mpi(mp.mpf(str(int(f_vec[2]))))
+            x = mpi(mp.mpf(str(int(f_vec[3]))))
+
+            denom = A * D - B * C
+            if denom.a <= 0 <= denom.b:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] denom contains 0 at dps={dps}")
+                break
+
+            S00 = A * u - (A * C) * v + B * w - (B * C) * x
+            S01 = (A * A) * v + (A * B) * x - (A * B) * u - (B * B) * w
+            S10 = C * u - (C * C) * v + w - C * x
+            S11 = (C * A) * v + A * x - (C * B) * u - B * w
+
+            # p and q intervals
+            try:
+                p1 = S00 / denom
+                p2 = S01 / denom
+                q1 = S10 / denom
+                q2 = S11 / denom
+            except ZeroDivisionError:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] division by zero in p/q at dps={dps}")
+                break
+
+            # r = w/x must be defined
+            if x.a <= 0 <= x.b:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] x contains 0 -> r undefined at dps={dps}")
+                break
+            r = w / x
+
+            # compute u-intervals
+            try:
+                p2_div_q2 = p2 / q2
+                p1_div_q1 = p1 / q1
+                q1_div_q2 = q1 / q2
+            except ZeroDivisionError:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] zero in q1/q2 divisions at dps={dps}")
+                break
+
+            u1 = _abs_interval(p2_div_q2)
+            u2 = _abs_interval(p2_div_q2 - p1_div_q1)
+            u3 = _abs_interval(q1_div_q2)
+
+            m = _max_intervals(u1, u2)
+            denom_1_minus_m = mpi(mp.mpf('1')) - m
+            if denom_1_minus_m.a <= 0 <= denom_1_minus_m.b:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] (1 - m) contains 0 at dps={dps}")
+                break
+
+            try:
+                term2 = (m * u3) / (denom_1_minus_m ** 2)
+                term3 = _abs_interval(u3 / denom_1_minus_m)
+            except ZeroDivisionError:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] division by zero computing term2/term3 at dps={dps}")
+                break
+
+            term1 = m
+            combined_max = _max_intervals(term1, term2, term3)
+
+            # ratio1: C/A requires A nonzero
+            if A.a <= 0 <= A.b:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] A contains 0 -> ratio1 undefined at dps={dps}")
+                break
+            ratio1 = _abs_interval(C / A)
+
+            denom_ratio2 = A - r * B
+            if denom_ratio2.a <= 0 <= denom_ratio2.b:
+                all_ok = False
+                local_log.append(f"[i={i_idx}] denom_ratio2 contains 0 at dps={dps}")
+                break
+            ratio2 = _abs_interval((C - r * D) / denom_ratio2)
+
+            finite_ok = (_interval_is_finite(u1) and _interval_is_finite(u2) and _interval_is_finite(u3) and
+                         _interval_is_finite(m) and _interval_is_finite(ratio1) and _interval_is_finite(ratio2))
+
+            per_i_combined.append(combined_max)
+            per_i_u1.append(u1)
+            per_i_ratio1.append(ratio1)
+            per_i_ratio2.append(ratio2)
+
+            # strict inequality checks (upper endpoint must be less than threshold)
+            cond_u1 = (u1.b < mp.mpf('0.5'))
+            cond_combined = (combined_max.b < mp.mpf('1.0'))
+            cond_r1 = (ratio1.b < mp.mpf('1.0'))
+            cond_r2 = (ratio2.b < mp.mpf('1.0'))
+
+            if not (cond_u1 and cond_combined and cond_r1 and cond_r2 and cond_e1 and cond_e2 and finite_ok):
+                all_ok = False
+                local_log.append(
+                    f"[i={i_idx}] Failed at dps={dps}: u1={u1}, combined_max={combined_max}, "
+                    f"ratio1={ratio1}, ratio2={ratio2}, finite_ok={finite_ok}"
+                )
+                break
+            # else this i passed: continue to next i
+
+        # aggregate across i
+        if per_i_combined:
+            overall_combined = _max_intervals(*per_i_combined)
+            overall_u1 = _max_intervals(*per_i_u1)
+            overall_r1 = _max_intervals(*per_i_ratio1)
+            overall_r2 = _max_intervals(*per_i_ratio2)
+        else:
+            # no per-i data (e.g., failed before any appended) -> NaN intervals
+            overall_combined = mpi(mp.mpf('nan'))
+            overall_u1 = mpi(mp.mpf('nan'))
+            overall_r1 = mpi(mp.mpf('nan'))
+            overall_r2 = mpi(mp.mpf('nan'))
+
+        if all_ok:
+            # success at this precision
+            return True, {
+                "dps": dps,
+                "overall_combined_max": overall_combined,
+                "overall_u1": overall_u1,
+                "overall_ratio1": overall_r1,
+                "overall_ratio2": overall_r2,
+                "A": A, "B": B, "C": C,
+                "log": local_log
+            }
+
+        # otherwise increase precision and retry
+        last_log = local_log[:]
+        dps *= mult
+
+    # reached max precision without proving strict inequalities
+    return False, {
+        "dps_max": mp.dps,
+        "overall_combined_max": overall_combined if 'overall_combined' in locals() else mpi(mp.mpf('nan')),
+        "overall_u1": overall_u1 if 'overall_u1' in locals() else mpi(mp.mpf('nan')),
+        "overall_ratio1": overall_r1 if 'overall_r1' in locals() else mpi(mp.mpf('nan')),
+        "overall_ratio2": overall_r2 if 'overall_r2' in locals() else mpi(mp.mpf('nan')),
+        "log": last_log
+    }
+
+
+# -----------------------------
+# Main scanning loop over b = 7..21
+# -----------------------------
+def main():
+    print("NAC checker for Lemma 3.5 v2 (b from 7 to 21).py starting")
+    found_pairs_all = []
+
+    # refinement stages: list of (b_increment, A_res, C_res)
+    refinements = [
+        (0.01, 200, 200),
+        (0.005, 400, 400),
+        (0.0025, 800, 800),
+    ]
+
+    for base_b in range(7, 22):
+        print(f"\n================= Running scan for b = {base_b} =================")
+
+        # Build list of (D1, D2) pairs for this b using tau = 1..b-2
+        pairs = []
+        for tau in range(1, base_b - 1):
+            D1 = tuple(i for i in range(base_b) if i != tau)
+            D2 = tuple(i for i in range(base_b) if i != (base_b - 1 - tau))
+            pairs.append((D1, D2))
+
+        total_pairs = len(pairs)
+        print(f"b={base_b}: Total (D1,D2) pairs to check: {total_pairs}")
+
+        found_pairs = []
+        progress_reported = set()
+
+        for idx, (D1, D2) in enumerate(pairs, start=1):
+            pct = int(100.0 * idx / total_pairs)
+            if pct not in progress_reported:
+                print(f"b={base_b} Progress: {pct}% ({idx}/{total_pairs} pairs checked)")
+                progress_reported.add(pct)
+
+            # compute A_i matrices for i=0..b-1, then f matrices
+            Ai_list = tuple(compute_Ai_matrix(D1, D2, i, base_b) for i in range(base_b))
+            f_mats = [f_matrix_from_A(Ai) for Ai in Ai_list]
+
+            # flatten f matrices into vectors for vectorized evaluation (u,v,w,x)
+            f_vectors = [np.array([v for row in fm for v in row], dtype=float) for fm in f_mats]
+
+            pair_verified = False
+
+            # try progressive refinements
+            for b_inc, A_res, C_res in refinements:
+                # build sampling grids
+                A_vals = np.linspace(-ABC_WIDTH, ABC_WIDTH, A_res)
+                C_vals = np.linspace(-ABC_WIDTH, ABC_WIDTH, C_res)
+                A_grid, C_grid = np.meshgrid(A_vals, C_vals)
+                B_values = np.arange(-1.0, 1.0 + b_inc / 2, b_inc)
+
+                found_any_in_refinement = False
+
+                # scan B values and test all f_vectors; break as soon as a rigorous success occurs
+                for B_scalar in B_values:
+                    # compute masks for each i and combine with logical AND
+                    masks = [evaluate_grid_conditions(A_grid, C_grid, B_scalar, fv) for fv in f_vectors]
+                    masks = np.array(masks)
+                    combined_mask = np.all(masks, axis=0)
+
+                    if np.any(combined_mask):
+                        i0, j0 = np.argwhere(combined_mask)[0]
+                        A_candidate = float(A_grid[i0, j0])
+                        C_candidate = float(C_grid[i0, j0])
+                        B_candidate = float(B_scalar)
+
+                        print(f"  Fast candidate found for b={base_b}, D1={D1}, D2={D2} "
+                              f"at refinement b_inc={b_inc}, A_res={A_res} -> "
+                              f"A={A_candidate}, B={B_candidate}, C={C_candidate}")
+
+                        # do rigorous check (mpmath interval arithmetic)
+                        success, info = rigorous_check_candidate(A_candidate, B_candidate, C_candidate,
+                                                                 f_vectors, initial_dps=80, max_dps=640, mult=2)
+
+                        overall_u1 = info.get("overall_u1")
+                        overall_combined = info.get("overall_combined_max")
+                        overall_r1 = info.get("overall_ratio1")
+                        overall_r2 = info.get("overall_ratio2")
+
+                        if overall_u1 is not None:
+                            print(f"  overall u1 across i: [{overall_u1.a} , {overall_u1.b}]  (interval)")
+                        if overall_combined is not None:
+                            print(f"  overall combined_max across i: [{overall_combined.a} , {overall_combined.b}]  (interval)")
+                        if overall_r1 is not None:
+                            print(f"  overall ratio1 across i: [{overall_r1.a} , {overall_r1.b}]  (interval)")
+                        if overall_r2 is not None:
+                            print(f"  overall ratio2 across i: [{overall_r2.a} , {overall_r2.b}]  (interval)")
+
+                        if success:
+                            print("  +++ RIGOROUS CHECK PASSED")
+                            found_pairs.append((D1, D2, {'A': A_candidate, 'B': B_candidate, 'C': C_candidate}, info))
+                            pair_verified = True
+                            found_any_in_refinement = True
+                            break
+                        else:
+                            print("  --- RIGOROUS CHECK FAILED/INCONCLUSIVE. Continuing search in this refinement.")
+                            if info.get("log"):
+                                print("   short reason (last):", info["log"][-1])
+                            # continue scanning B values for other candidates
+
+                if pair_verified:
+                    break
+
+                # if we found candidates but none passed rigorously, try next refinement
+                if found_any_in_refinement:
+                    continue
+
+                # otherwise, try next refinement level
+
+            if not pair_verified:
+                print(f"--> No rigorous full-way overlap was proved for b={base_b}, D1={D1}, D2={D2}.")
+
+        # per-b summary
+        print(f"\nFinished scan for b={base_b}.")
+        print(f"Pairs tested for b={base_b}: {total_pairs}")
+        print(f"Pairs with full-way overlap (rigorously proved) for b={base_b}: {len(found_pairs)}")
+        if found_pairs:
+            print("\nFull-overlap rigorous examples for b={}:".format(base_b))
+            for D1, D2, example, info in found_pairs:
+                print(f"  D1={D1}, D2={D2} -> A={example['A']:.12g}, B={example['B']:.12g}, C={example['C']:.12g}")
+
+        # collect global results
+        found_pairs_all.extend(((base_b, fp) for fp in found_pairs))
+
+    # global summary
+    print("\n\nALL b scans complete.")
+    print(f"Total b values scanned: {len(range(7,22))} (7..21)")
+
+
+if __name__ == "__main__":
+    main()

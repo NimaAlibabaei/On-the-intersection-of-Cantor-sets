@@ -1,0 +1,518 @@
+"""
+# NAC checker for Lemma 3.5 v2 (b over 21)
+"""
+
+from decimal import Decimal, getcontext, localcontext, ROUND_FLOOR, ROUND_CEILING
+import time
+import sys
+
+# -----------------------------
+# Configuration
+# -----------------------------
+DECIMALS = 160
+INITIAL_GRID_NX = 36
+INITIAL_GRID_NY = 36
+VERBOSE = True
+# -----------------------------
+getcontext().prec = DECIMALS
+
+# -----------------------------
+# Decimal helpers
+# -----------------------------
+def D(x):
+    if isinstance(x, float):
+        raise TypeError("Float input is forbidden for rigor.")
+    return x if isinstance(x, Decimal) else Decimal(str(x))
+
+
+def short_decimal(x, sig=10):
+    if x is None:
+        return "None"
+    try:
+        xd = Decimal(x)
+    except Exception:
+        s = str(x)
+        return s if len(s) <= 20 else s[:20] + "..."
+    if xd.is_infinite():
+        return "Infinity"
+    if xd.is_nan():
+        return "NaN"
+    if xd == 0:
+        return "0"
+    sign = "-" if xd.is_signed() else ""
+    abs_x = abs(xd)
+    fmt = f".{sig-1}E"
+    sE = format(abs_x, fmt)           # scientific with (sig) digits
+    mantissa, exponent = sE.split('E')
+    exp = int(exponent)
+    mant = mantissa.replace('.', '')  # exactly sig digits
+    pos = 1 + exp
+    if pos <= 0:
+        fixed = "0." + ("0" * (-pos)) + mant
+    elif pos >= len(mant):
+        fixed = mant + ("0" * (pos - len(mant)))
+    else:
+        fixed = mant[:pos] + "." + mant[pos:]
+    if '.' in fixed:
+        fixed = fixed.rstrip('0').rstrip('.')
+    out = sign + fixed + "..."
+    return out
+
+# Directed rounding helpers (use DECIMALS)
+def floor_dec(x):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS
+        ctx.rounding = ROUND_FLOOR
+        return +x
+
+def ceil_dec(x):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS
+        ctx.rounding = ROUND_CEILING
+        return +x
+
+
+
+
+def add_down(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        return +(a + b)
+
+def add_up(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        return +(a + b)
+
+def sub_down(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        return +(a - b)
+
+def sub_up(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        return +(a - b)
+
+def mul_down(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        return +(a * b)
+
+def mul_up(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        return +(a * b)
+
+def div_down(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        return +(a / b)
+
+def div_up(a, b):
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        return +(a / b)
+
+
+
+# -----------------------------
+# Interval class using Decimal with directed endpoints
+# -----------------------------
+class IntervalD:
+    __slots__ = ("lo", "hi")
+    def __init__(self, lo, hi=None):
+        # Accept ints/str/Decimal but not floats
+        if hi is None:
+            x = D(lo)
+            self.lo = floor_dec(x)
+            self.hi = ceil_dec(x)
+        else:
+            a = D(lo); b = D(hi)
+            if a > b:
+                raise ValueError("Interval lower bound larger than upper bound")
+            self.lo = floor_dec(a)
+            self.hi = ceil_dec(b)
+    def __repr__(self):
+        return f"[{self.lo} , {self.hi}]"
+
+# Directed interval arithmetic (conservative)
+def interval_add(A: IntervalD, B):
+    B = B if isinstance(B, IntervalD) else IntervalD(B, B)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        lo = A.lo + B.lo
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        hi = A.hi + B.hi
+    return IntervalD(lo, hi)
+
+def interval_sub(A: IntervalD, B):
+    B = B if isinstance(B, IntervalD) else IntervalD(B, B)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        lo = A.lo - B.hi
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        hi = A.hi - B.lo
+    return IntervalD(lo, hi)
+
+def interval_mul(A: IntervalD, B):
+    B = B if isinstance(B, IntervalD) else IntervalD(B, B)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        p1 = A.lo * B.lo; p2 = A.lo * B.hi; p3 = A.hi * B.lo; p4 = A.hi * B.hi
+        lo = min(p1, p2, p3, p4)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        p1 = A.lo * B.lo; p2 = A.lo * B.hi; p3 = A.hi * B.lo; p4 = A.hi * B.hi
+        hi = max(p1, p2, p3, p4)
+    return IntervalD(lo, hi)
+
+def interval_div(A: IntervalD, B):
+    B = B if isinstance(B, IntervalD) else IntervalD(B, B)
+    if B.lo <= 0 <= B.hi:
+        raise ZeroDivisionError("Division by interval containing zero")
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        cand_lo = [A.lo / B.lo, A.lo / B.hi, A.hi / B.lo, A.hi / B.hi]
+        lo = min(cand_lo)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        cand_hi = [A.lo / B.lo, A.lo / B.hi, A.hi / B.lo, A.hi / B.hi]
+        hi = max(cand_hi)
+    return IntervalD(lo, hi)
+
+def interval_abs(A: IntervalD):
+    if A.lo >= 0:
+        return IntervalD(A.lo, A.hi)
+    if A.hi <= 0:
+        return IntervalD(-A.hi, -A.lo)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        lo = D('0')
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        hi = max(-A.lo, A.hi)
+    return IntervalD(lo, hi)
+
+# -----------------------------
+# Parameters in Lemma 3.5
+# -----------------------------
+# SCALE is 80/29
+SCALE = interval_div(IntervalD('80','80'), IntervalD('29','29'))
+
+def pqq_case_0(u_lo,u_hi,v_lo,v_hi):
+    u = IntervalD(u_lo,u_hi); v = IntervalD(v_lo,v_hi)
+    p1_lin = interval_add(interval_mul(u, IntervalD('150')),
+                          interval_sub(interval_mul(v, IntervalD('865')), IntervalD('95')))
+    p2_lin = interval_add(interval_mul(u, IntervalD('-450')),
+                          interval_add(interval_mul(v, IntervalD('-855')), IntervalD('285')))
+    q1_lin = interval_add(interval_mul(u, IntervalD('50')),
+                          interval_sub(interval_mul(v, IntervalD('675')), IntervalD('225')))
+    q2_lin = interval_add(interval_mul(u, IntervalD('-150')),
+                          interval_add(interval_mul(v, IntervalD('-1445')), IntervalD('675')))
+    return (interval_mul(p1_lin, SCALE),
+            interval_mul(p2_lin, SCALE),
+            interval_mul(q1_lin, SCALE),
+            interval_mul(q2_lin, SCALE))
+
+def pqq_case_1(u_lo,u_hi,v_lo,v_hi):
+    u = IntervalD(u_lo,u_hi); v = IntervalD(v_lo,v_hi)
+    p1_lin = interval_add(interval_mul(u, IntervalD('-150')),
+                          interval_add(interval_mul(v, IntervalD('-635')), IntervalD('55')))
+    p2_lin = interval_add(interval_mul(u, IntervalD('450')),
+                          interval_add(interval_mul(v, IntervalD('165')), IntervalD('-165')))
+    q1_lin = interval_add(interval_mul(u, IntervalD('-50')),
+                          interval_add(interval_mul(v, IntervalD('175')), IntervalD('-175')))
+    q2_lin = interval_add(interval_mul(u, IntervalD('150')),
+                          interval_add(interval_mul(v, IntervalD('-1105')), IntervalD('525')))
+    return (interval_mul(p1_lin, SCALE),
+            interval_mul(p2_lin, SCALE),
+            interval_mul(q1_lin, SCALE),
+            interval_mul(q2_lin, SCALE))
+
+def pqq_case_2(u_lo,u_hi,v_lo,v_hi):
+    u = IntervalD(u_lo,u_hi); v = IntervalD(v_lo,v_hi)
+    p1_lin = interval_add(interval_mul(u, IntervalD('150')),
+                          interval_sub(interval_mul(v, IntervalD('565')), IntervalD('95')))
+    p2_lin = interval_add(interval_mul(u, IntervalD('-450')),
+                          interval_add(interval_mul(v, IntervalD('45')), IntervalD('285')))
+    q1_lin = interval_add(interval_mul(u, IntervalD('50')),
+                          interval_sub(interval_mul(v, IntervalD('575')), IntervalD('225')))
+    q2_lin = interval_add(interval_mul(u, IntervalD('-150')),
+                          interval_add(interval_mul(v, IntervalD('-1145')), IntervalD('675')))
+    return (interval_mul(p1_lin, SCALE),
+            interval_mul(p2_lin, SCALE),
+            interval_mul(q1_lin, SCALE),
+            interval_mul(q2_lin, SCALE))
+
+def pqq_case_3(u_lo,u_hi,v_lo,v_hi):
+    u = IntervalD(u_lo,u_hi); v = IntervalD(v_lo,v_hi)
+    p1_lin = interval_add(interval_mul(u, IntervalD('-600')),
+                          interval_add(interval_mul(v, IntervalD('1025')), IntervalD('410')))
+    p2_lin = interval_add(interval_mul(u, IntervalD('1800')),
+                          interval_add(interval_mul(v, IntervalD('1681')), IntervalD('-1230')))
+    q1_lin = interval_add(interval_mul(u, IntervalD('-200')),
+                          interval_add(interval_mul(v, IntervalD('-625')), IntervalD('-250')))
+    q2_lin = interval_add(interval_mul(u, IntervalD('600')),
+                          interval_add(interval_mul(v, IntervalD('-1025')), IntervalD('750')))
+    return (interval_mul(p1_lin, SCALE),
+            interval_mul(p2_lin, SCALE),
+            interval_mul(q1_lin, SCALE),
+            interval_mul(q2_lin, SCALE))
+
+def pqq_case_4(u_lo,u_hi,v_lo,v_hi):
+    u = IntervalD(u_lo,u_hi); v = IntervalD(v_lo,v_hi)
+    p1_lin = interval_add(interval_mul(u, IntervalD('-600')),
+                          interval_add(interval_mul(v, IntervalD('445')), IntervalD('410')))
+    p2_lin = interval_add(interval_mul(u, IntervalD('1800')),
+                          interval_add(interval_mul(v, IntervalD('869')), IntervalD('-1230')))
+    q1_lin = interval_add(interval_mul(u, IntervalD('-200')),
+                          interval_add(interval_mul(v, IntervalD('2275')), IntervalD('-250')))
+    q2_lin = interval_add(interval_mul(u, IntervalD('600')),
+                          interval_add(interval_mul(v, IntervalD('-1605')), IntervalD('750')))
+    return (interval_mul(p1_lin, SCALE),
+            interval_mul(p2_lin, SCALE),
+            interval_mul(q1_lin, SCALE),
+            interval_mul(q2_lin, SCALE))
+
+def pqq_case_5(u_lo,u_hi,v_lo,v_hi):
+    # Case 5 is identical to case 2 per problem statement
+    return pqq_case_2(u_lo,u_hi,v_lo,v_hi)
+
+
+# Helper for exact rational endpoints as Decimals with directed rounding
+def rat_lo(p, q):  # lower endpoint: round down
+    return div_down(D(p), D(q))
+
+def rat_hi(p, q):  # upper endpoint: round up
+    return div_up(D(p), D(q))
+
+# Case function table: (function, (u0_lo,u0_hi,v0_lo,v0_hi))
+CASE_FUNCS = {
+    0: (pqq_case_0, (D('0'), rat_hi(1, 2), D('0'), rat_hi(1, 22))),
+    1: (pqq_case_1, (rat_lo(5, 11), D('1'), D('0'), rat_hi(1, 22))),
+    2: (pqq_case_2, (D('0'), D('1'), D('0'), rat_hi(1, 22))),
+    3: (pqq_case_3, (rat_lo(5, 11), D('1'), D('0'), rat_hi(1, 22))),
+    4: (pqq_case_4, (rat_lo(11, 24), D('1'), D('0'), rat_hi(1, 22))),
+    5: (pqq_case_5, (D('0'), D('1'), D('0'), rat_hi(1, 22))),
+}
+
+# -----------------------------
+# Compute rho bounds on a single small cell
+# -----------------------------
+def compute_rhos_on_cell(case_idx, u_lo, u_hi, v_lo, v_hi):
+    """
+    Compute provable upper bounds (rho1..rho4) on the cell [u_lo,u_hi] x [v_lo,v_hi].
+    Returns dict with rho1..rho4 and intermediate intervals OR {'error': reason}.
+    Possible errors: 'denom_zero' (q1/q2 straddle 0), 'one_minus_m_nonpos' (1-m <=0).
+    """
+    func, _ = CASE_FUNCS[case_idx]
+    p1, p2, q1, q2 = func(u_lo, u_hi, v_lo, v_hi)
+
+    # if q1 or q2 straddle zero, caller should try local subdivision first
+    if q1.lo <= 0 <= q1.hi or q2.lo <= 0 <= q2.hi:
+        return {'error': 'denom_zero'}
+
+    # safe divisions
+    r_p2_q2 = interval_div(p2, q2)
+    r_p1_q1 = interval_div(p1, q1)
+    r_q1_q2 = interval_div(q1, q2)
+
+    u1 = interval_abs(r_p2_q2)
+    u2 = interval_abs(interval_sub(r_p2_q2, r_p1_q1))
+    u3 = interval_abs(r_q1_q2)
+
+    # m interval as max of u1 and u2 (conservative endpoints)
+    m_lo = max(u1.lo, u2.lo)
+    m_hi = max(u1.hi, u2.hi)
+    m = IntervalD(m_lo, m_hi)
+
+    # rho1 (sup |p2/q2|) and rho2 (sup m) provable upper bounds
+    rho1_sup = ceil_dec(u1.hi)
+    rho2_sup = ceil_dec(m.hi)
+
+    # compute one_minus_m interval endpoints conservatively
+    one_minus_m_lo = sub_down(D('1'), m.hi)
+    if one_minus_m_lo <= 0:
+        return {'error': 'one_minus_m_nonpos'}
+    # compute rho3 ≈ (m * u3) / (1-m)^2 with directed rounding
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        numerator_sup = +(m.hi * u3.hi)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_FLOOR
+        denom_min = +(one_minus_m_lo * one_minus_m_lo)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        rho3_sup = +(numerator_sup / denom_min)
+
+    # rho4 ≈ u3 / (1-m)
+    with localcontext() as ctx:
+        ctx.prec = DECIMALS; ctx.rounding = ROUND_CEILING
+        rho4_sup = +(u3.hi / one_minus_m_lo)
+
+    return {
+        'rho1': rho1_sup,
+        'rho2': rho2_sup,
+        'rho3': rho3_sup,
+        'rho4': rho4_sup,
+        'u1': u1, 'u2': u2, 'u3': u3, 'm': m
+    }
+
+
+# -----------------------------
+# Subdivide a rectangle into nx * ny equal cells
+# -----------------------------
+def subdivide_cell(ulo, uhi, vlo, vhi, nx, ny):
+    ulo = D(ulo); uhi = D(uhi); vlo = D(vlo); vhi = D(vhi)
+    nxD = D(nx); nyD = D(ny)
+
+    # outward step bounds are not required if we compute each boundary outward directly,
+    # but we still need a step estimate:
+    du_down = div_down(sub_down(uhi, ulo), nxD)
+    du_up   = div_up  (sub_up  (uhi, ulo), nxD)
+    dv_down = div_down(sub_down(vhi, vlo), nyD)
+    dv_up   = div_up  (sub_up  (vhi, vlo), nyD)
+
+    out = []
+    for i in range(nx):
+        # a_lo = ulo + i*du (rounded down)
+        a_lo = add_down(ulo, mul_down(D(i), du_down))
+        # a_hi = ulo + (i+1)*du (rounded up)
+        a_hi = add_up  (ulo, mul_up  (D(i+1), du_up))
+        if i == 0:
+            a_lo = ulo
+        if i == nx - 1:
+            a_hi = uhi
+
+        for j in range(ny):
+            b_lo = add_down(vlo, mul_down(D(j), dv_down))
+            b_hi = add_up  (vlo, mul_up  (D(j+1), dv_up))
+            if j == 0:
+                b_lo = vlo
+            if j == ny - 1:
+                b_hi = vhi
+
+            out.append((a_lo, a_hi, b_lo, b_hi))
+    return out
+
+
+# -----------------------------
+# Adaptive refinement driver for one case
+# -----------------------------
+def cell_safe(res):
+    # strict inequalities in your success test
+    return (res['rho1'] < D('0.5')) and (max(res['rho2'], res['rho3'], res['rho4']) < D('1'))
+
+def split_cell(cell):
+    ulo, uhi, vlo, vhi = cell
+    um = div_down(add_down(ulo, uhi), D('2'))
+    vm = div_down(add_down(vlo, vhi), D('2'))
+    return [
+        (ulo, um,  vlo, vm),
+        (um, uhi,  vlo, vm),
+        (ulo, um,  vm, vhi),
+        (um, uhi,  vm, vhi),
+    ]
+
+def rigorous_refine_case(case_idx, max_splits=200000):
+    func, domain = CASE_FUNCS[case_idx]
+    u0_lo, u0_hi, v0_lo, v0_hi = domain
+
+    # Initial cover: a full grid cover
+    active = subdivide_cell(u0_lo, u0_hi, v0_lo, v0_hi, INITIAL_GRID_NX, INITIAL_GRID_NY)
+    done_count = 0
+    splits = 0
+
+    best_rho1 = D('0'); best_rho2 = D('0'); best_rho3 = D('0'); best_rho4 = D('0')
+
+    # Optional: priority by "worst" rho3 bound (larger first)
+    # We'll just sort occasionally to avoid O(n log n) every loop.
+    processed = 0
+    while active:
+        cell = active.pop()
+        processed += 1
+
+        res = compute_rhos_on_cell(case_idx, cell[0], cell[1], cell[2], cell[3])
+        if 'error' in res:
+            # denom crossing / one_minus_m_nonpos: must refine, not drop
+            if splits >= max_splits:
+                return {'error': 'split_limit_reached', 'rho1': best_rho1, 'rho2': best_rho2, 'rho3': best_rho3, 'rho4': best_rho4}
+            children = split_cell(cell)
+            active.extend(children)
+            splits += 1
+            continue
+
+        # update global sups (true sups over processed cells; still valid as a running report)
+        best_rho1 = max(best_rho1, res['rho1'])
+        best_rho2 = max(best_rho2, res['rho2'])
+        best_rho3 = max(best_rho3, res['rho3'])
+        best_rho4 = max(best_rho4, res['rho4'])
+
+        if cell_safe(res):
+            done_count += 1
+        else:
+            # Not safe => refine
+            if splits >= max_splits:
+                return {'error': 'split_limit_reached', 'rho1': best_rho1, 'rho2': best_rho2, 'rho3': best_rho3, 'rho4': best_rho4}
+            children = split_cell(cell)
+            active.extend(children)
+            splits += 1
+
+        if VERBOSE and (processed % 5000 == 0):
+            print(f"[Case {case_idx}] processed={processed}, done={done_count}, active={len(active)}, splits={splits}")
+            print("  running sups:",
+                "rho1 ≤", short_decimal(best_rho1),
+                "rho2 ≤", short_decimal(best_rho2),
+                "rho3 ≤", short_decimal(best_rho3),
+                "rho4 ≤", short_decimal(best_rho4))
+            sys.stdout.flush()
+
+        if len(active) > 20000 and (splits % 2000 == 0):
+            active = active[-50000:] + active[:-50000]
+
+    # If we emptied active, every cell was certified safe => proof
+    return {'rho1': best_rho1, 'rho2': best_rho2, 'rho3': best_rho3, 'rho4': best_rho4}
+
+
+# -----------------------------
+# Main driver
+# -----------------------------
+def main():
+    print("NAC checker for Lemma 3.5 v2 (b over 21).py starting; DECIMALS =", DECIMALS)
+    t0 = time.time()
+    all_results = {}
+    for case_idx in range(6):
+        print("\n===== CASE", case_idx, "=====")
+        res = rigorous_refine_case(case_idx)
+        all_results[case_idx] = res
+        if 'error' in res:
+            print("Case", case_idx, "FAILED:", res['error'])
+            continue
+        print("Case", case_idx, "result:")
+        print("  rho1 ≤", short_decimal(res['rho1']))
+        print("  rho2 ≤", short_decimal(res['rho2']))
+        print("  rho3 ≤", short_decimal(res['rho3']))
+        print("  rho4 ≤", short_decimal(res['rho4']))
+        ok1 = (res['rho1'] >= 0) and (res['rho1'] < D('0.5'))
+        ok2 = (max(res['rho2'], res['rho3'], res['rho4']) >= 0) and (max(res['rho2'], res['rho3'], res['rho4']) < D('1'))
+        print("rho1<1/2 ? ->", ok1, "max(rho2..rho4) <1 ? ->", ok2)
+
+    t1 = time.time()
+    print("\nTotal time: {:.3f} s".format(t1 - t0))
+    print("\nSummary:")
+    for ci, res in all_results.items():
+        print(f"Case {ci}:")
+        if 'error' in res:
+            print("  FAILED:", res['error'])
+            continue
+        print("  rho1 ≤", short_decimal(res['rho1']))
+        print("  rho2 ≤", short_decimal(res['rho2']))
+        print("  rho3 ≤", short_decimal(res['rho3']))
+        print("  rho4 ≤", short_decimal(res['rho4']))
+    return all_results
+
+if __name__ == "__main__":
+    main()
